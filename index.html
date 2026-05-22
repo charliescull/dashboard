@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Charlie Scullion's Board</title>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <style>
   :root {
     --text-primary: #FAFAFA;
@@ -1498,6 +1499,168 @@ renderStreak();
 updateDayBar();
 setInterval(updateDayBar, 60 * 1000);
 startTicker();
+
+// ── Supabase Sync ─────────────────────────────────────────────────────────────
+(function initSupabaseSync() {
+  const SUPABASE_URL = 'https://fntashiwcbooeqmukcak.supabase.co';
+  const SUPABASE_KEY = 'sb_publishable_aFr9XKECSnIQES6cpBed9g_IfjqZ7Ym';
+  const APP_KEY = 'dashboard';
+
+  const client = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+
+  let lastSyncedJson = null;
+  let pendingRemote = null;
+  let pushTimer = null;
+  let isFocused = false;
+
+  document.addEventListener('focusin', e => {
+    const t = e.target;
+    if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' ||
+        t.tagName === 'SELECT' || t.isContentEditable)) {
+      isFocused = true;
+    }
+  });
+  document.addEventListener('focusout', () => {
+    isFocused = false;
+    if (pendingRemote) { applyRemote(pendingRemote); pendingRemote = null; }
+  });
+
+  function collectLocal() {
+    const state = {};
+    state['goal_streak_v1'] = JSON.parse(localStorage.getItem('goal_streak_v1') || 'null');
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k && k.startsWith('goals:')) {
+        state[k] = JSON.parse(localStorage.getItem(k));
+      }
+    }
+    return state;
+  }
+
+  function applyRemote(state) {
+    for (const [k, v] of Object.entries(state)) {
+      if (v === null) localStorage.removeItem(k);
+      else localStorage.setItem(k, JSON.stringify(v));
+    }
+    loadToday();
+    loadTomorrow();
+    renderStreak();
+  }
+
+  async function pushNow() {
+    try {
+      const state = collectLocal();
+      const json = JSON.stringify(state);
+      if (json === lastSyncedJson) return;
+      lastSyncedJson = json;
+      const { error } = await client.from('app_state').upsert(
+        { key: APP_KEY, data: state },
+        { onConflict: 'key' }
+      );
+      if (error) console.warn('[sync] push error', error);
+    } catch (err) {
+      console.warn('[sync] push failed', err);
+    }
+  }
+
+  function schedulePush() {
+    if (pushTimer) clearTimeout(pushTimer);
+    pushTimer = setTimeout(pushNow, 250);
+  }
+
+  async function flushOnClose() {
+    if (!pushTimer) return;
+    clearTimeout(pushTimer);
+    pushTimer = null;
+    try {
+      const state = collectLocal();
+      const json = JSON.stringify(state);
+      if (json === lastSyncedJson) return;
+      lastSyncedJson = json;
+      await fetch(`${SUPABASE_URL}/rest/v1/app_state`, {
+        method: 'POST',
+        keepalive: true,
+        headers: {
+          'Content-Type': 'application/json',
+          'apikey': SUPABASE_KEY,
+          'Authorization': `Bearer ${SUPABASE_KEY}`,
+          'Prefer': 'resolution=merge-duplicates',
+        },
+        body: JSON.stringify({ key: APP_KEY, data: state }),
+      });
+    } catch {}
+  }
+
+  window.addEventListener('pagehide', flushOnClose);
+  window.addEventListener('beforeunload', flushOnClose);
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') flushOnClose();
+  });
+
+  const _setItem = localStorage.setItem.bind(localStorage);
+  const _removeItem = localStorage.removeItem.bind(localStorage);
+
+  localStorage.setItem = function(key, value) {
+    _setItem(key, value);
+    if (key === 'goal_streak_v1' || key.startsWith('goals:')) schedulePush();
+  };
+  localStorage.removeItem = function(key) {
+    _removeItem(key);
+    if (key === 'goal_streak_v1' || key.startsWith('goals:')) schedulePush();
+  };
+
+  async function init() {
+    try {
+      const { data, error } = await client
+        .from('app_state')
+        .select('data')
+        .eq('key', APP_KEY)
+        .single();
+
+      if (error && error.code !== 'PGRST116') {
+        console.warn('[sync] init pull error', error);
+      } else if (data?.data) {
+        const remoteJson = JSON.stringify(data.data);
+        const localState = collectLocal();
+        const localHasData = Object.values(localState).some(v => v !== null);
+        const remoteIsEmpty = Object.values(data.data).every(v => v === null);
+        if (localHasData && remoteIsEmpty) {
+          await pushNow();
+        } else {
+          lastSyncedJson = remoteJson;
+          applyRemote(data.data);
+        }
+      } else {
+        await pushNow();
+      }
+    } catch (err) {
+      console.warn('[sync] init failed', err);
+    }
+
+    client
+      .channel(`app_state:${APP_KEY}`)
+      .on('postgres_changes', {
+        event: '*',
+        schema: 'public',
+        table: 'app_state',
+        filter: `key=eq.${APP_KEY}`,
+      }, payload => {
+        const incoming = payload.new?.data;
+        if (!incoming) return;
+        const incomingJson = JSON.stringify(incoming);
+        if (incomingJson === lastSyncedJson) return;
+        lastSyncedJson = incomingJson;
+        if (isFocused) {
+          pendingRemote = incoming;
+        } else {
+          applyRemote(incoming);
+        }
+      })
+      .subscribe();
+  }
+
+  init();
+})();
 </script>
 
 <nav class="tabbar" aria-label="Main navigation">
