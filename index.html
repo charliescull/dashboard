@@ -1508,6 +1508,11 @@ startTicker();
 
   const client = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
+  // Capture originals before patching — applyRemote uses these directly
+  // so writing remote data never triggers a push back to Supabase.
+  const _setItem = localStorage.setItem.bind(localStorage);
+  const _removeItem = localStorage.removeItem.bind(localStorage);
+
   let lastSyncedJson = null;
   let pendingRemote = null;
   let pushTimer = null;
@@ -1527,7 +1532,8 @@ startTicker();
 
   function collectLocal() {
     const state = {};
-    state['goal_streak_v1'] = JSON.parse(localStorage.getItem('goal_streak_v1') || 'null');
+    const raw = localStorage.getItem('goal_streak_v1');
+    state['goal_streak_v1'] = raw !== null ? JSON.parse(raw) : null;
     for (let i = 0; i < localStorage.length; i++) {
       const k = localStorage.key(i);
       if (k && k.startsWith('goals:')) {
@@ -1537,11 +1543,16 @@ startTicker();
     return state;
   }
 
+  // Uses original _setItem/_removeItem so applying remote never
+  // triggers schedulePush() — no push-back loop possible.
   function applyRemote(state) {
     for (const [k, v] of Object.entries(state)) {
-      if (v === null) localStorage.removeItem(k);
-      else localStorage.setItem(k, JSON.stringify(v));
+      if (v === null) _removeItem(k);
+      else _setItem(k, JSON.stringify(v));
     }
+    // Align lastSyncedJson with what collectLocal() would return now,
+    // preventing a false "dirty" detection and spurious re-push.
+    lastSyncedJson = JSON.stringify(collectLocal());
     loadToday();
     loadTomorrow();
     renderStreak();
@@ -1597,9 +1608,7 @@ startTicker();
     if (document.visibilityState === 'hidden') flushOnClose();
   });
 
-  const _setItem = localStorage.setItem.bind(localStorage);
-  const _removeItem = localStorage.removeItem.bind(localStorage);
-
+  // Patch localStorage so user-driven writes trigger a push.
   localStorage.setItem = function(key, value) {
     _setItem(key, value);
     if (key === 'goal_streak_v1' || key.startsWith('goals:')) schedulePush();
@@ -1619,24 +1628,20 @@ startTicker();
 
       if (error && error.code !== 'PGRST116') {
         console.warn('[sync] init pull error', error);
-      } else if (data?.data) {
-        const remoteJson = JSON.stringify(data.data);
-        const localState = collectLocal();
-        const localHasData = Object.values(localState).some(v => v !== null);
-        const remoteIsEmpty = Object.values(data.data).every(v => v === null);
-        if (localHasData && remoteIsEmpty) {
-          await pushNow();
-        } else {
-          lastSyncedJson = remoteJson;
-          applyRemote(data.data);
-        }
+      } else if (data?.data && Object.keys(data.data).length > 0) {
+        // Remote has data — always apply it on load so the latest
+        // changes from any device are reflected immediately.
+        applyRemote(data.data);
       } else {
+        // No remote row yet — seed Supabase from local.
         await pushNow();
       }
     } catch (err) {
       console.warn('[sync] init failed', err);
     }
 
+    // Live updates: no echo-check needed because applyRemote never
+    // pushes back, so there is no loop risk.
     client
       .channel(`app_state:${APP_KEY}`)
       .on('postgres_changes', {
@@ -1647,9 +1652,6 @@ startTicker();
       }, payload => {
         const incoming = payload.new?.data;
         if (!incoming) return;
-        const incomingJson = JSON.stringify(incoming);
-        if (incomingJson === lastSyncedJson) return;
-        lastSyncedJson = incomingJson;
         if (isFocused) {
           pendingRemote = incoming;
         } else {
