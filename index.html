@@ -1505,68 +1505,118 @@ startTicker();
   var SB_URL  = 'https://fntashiwcbooeqmukcak.supabase.co';
   var SB_KEY  = 'sb_publishable_aFr9XKECSnIQES6cpBed9g_IfjqZ7Ym';
   var APP_KEY = 'dashboard';
-  var HDRS    = {
-    'Content-Type':  'application/json',
-    'apikey':        SB_KEY,
-    'Authorization': 'Bearer ' + SB_KEY,
-    'Prefer':        'resolution=merge-duplicates,return=minimal',
+  var RH = { 'apikey': SB_KEY, 'Authorization': 'Bearer ' + SB_KEY };
+  var WH = {
+    'Content-Type': 'application/json',
+    'apikey': SB_KEY, 'Authorization': 'Bearer ' + SB_KEY,
+    'Prefer': 'resolution=merge-duplicates,return=minimal',
   };
 
-  // Capture native storage ops before monkey-patching so applyRemote
-  // never triggers a push-back loop.
-  var _setItem    = localStorage.setItem.bind(localStorage);
-  var _removeItem = localStorage.removeItem.bind(localStorage);
-
+  var _set    = localStorage.setItem.bind(localStorage);
+  var _del    = localStorage.removeItem.bind(localStorage);
   var pushTimer = null;
   var isPushing = false;
 
-  function owned(k) {
-    return k === 'goal_streak_v1' || (k && k.indexOf('goals:') === 0);
+  // ── visible sync toast (helps diagnose phone issues) ─────────────────────
+  var toast = null;
+  function showToast(msg, color) {
+    if (!toast) {
+      toast = document.createElement('div');
+      toast.style.cssText = 'position:fixed;top:12px;right:12px;z-index:9999;padding:4px 10px;border-radius:8px;font-size:11px;font-weight:600;color:#fff;opacity:0;transition:opacity .3s;pointer-events:none;';
+      document.body.appendChild(toast);
+    }
+    toast.textContent = msg;
+    toast.style.background = color || '#333';
+    toast.style.opacity = '1';
+    clearTimeout(toast._t);
+    toast._t = setTimeout(function(){ toast.style.opacity = '0'; }, 2500);
   }
 
-  function collectLocal() {
-    var out = {};
-    var raw = localStorage.getItem('goal_streak_v1');
-    out['goal_streak_v1'] = raw ? JSON.parse(raw) : null;
-    for (var i = 0; i < localStorage.length; i++) {
-      var k = localStorage.key(i);
-      if (k && k.indexOf('goals:') === 0) {
-        try { out[k] = JSON.parse(localStorage.getItem(k)); } catch(e) {}
+  // ── merge goal arrays: union by text, prefer done:true ───────────────────
+  function mergeGoals(a, b) {
+    var seen = {}, out = [];
+    (a || []).concat(b || []).forEach(function(g) {
+      if (!g || !g.text) return;
+      if (seen[g.text] !== undefined) {
+        if (g.done && !out[seen[g.text]].done) {
+          out[seen[g.text]].done = true;
+          out[seen[g.text]].doneAt = g.doneAt;
+        }
+      } else {
+        seen[g.text] = out.length;
+        out.push({ text: g.text, done: !!g.done, doneAt: g.doneAt });
       }
-    }
+    });
     return out;
   }
 
-  function applyRemote(remote) {
-    if (!remote || typeof remote !== 'object') return;
-    var keys = Object.keys(remote);
-    for (var i = 0; i < keys.length; i++) {
-      var k = keys[i];
-      if (!owned(k)) continue;
-      var v = remote[k];
-      if (v === null || v === undefined) _removeItem(k);
-      else _setItem(k, JSON.stringify(v));
+  // ── collect what this device currently has ────────────────────────────────
+  function local() {
+    var s = {};
+    var r = localStorage.getItem('goal_streak_v1');
+    s.goal_streak_v1 = r ? JSON.parse(r) : null;
+    for (var i = 0; i < localStorage.length; i++) {
+      var k = localStorage.key(i);
+      if (k && k.indexOf('goals:') === 0)
+        try { s[k] = JSON.parse(localStorage.getItem(k)); } catch(e){}
     }
-    loadToday();
-    loadTomorrow();
-    renderStreak();
+    return s;
   }
 
-  // ── Push: plain fetch so it works on every mobile browser ────────────────
+  // ── merge local + remote into one state ───────────────────────────────────
+  // Local goal-date keys win for existence (respects rollover deletes).
+  // Goal arrays are unioned so neither device loses individual goals.
+  function merge(loc, rem) {
+    var m = { goal_streak_v1: loc.goal_streak_v1 || (rem && rem.goal_streak_v1) || null };
+    for (var k in loc)
+      if (k.indexOf('goals:') === 0)
+        m[k] = mergeGoals(loc[k], rem ? rem[k] : null);
+    return m;
+  }
+
+  // ── write merged state to localStorage and re-render ─────────────────────
+  function applyState(s) {
+    if (!s) return;
+    for (var k in s) {
+      if (k !== 'goal_streak_v1' && k.indexOf('goals:') !== 0) continue;
+      s[k] == null ? _del(k) : _set(k, JSON.stringify(s[k]));
+    }
+    loadToday(); loadTomorrow(); renderStreak();
+  }
+
+  // ── fetch current Supabase state ──────────────────────────────────────────
+  async function fetchRemote() {
+    try {
+      var r = await fetch(SB_URL + '/rest/v1/app_state?key=eq.' + APP_KEY + '&select=data', { headers: RH });
+      if (!r.ok) return null;
+      var rows = await r.json();
+      return (rows && rows[0]) ? rows[0].data : null;
+    } catch(e) { return null; }
+  }
+
+  // ── push: read-modify-write so devices never overwrite each other ─────────
   async function push() {
     pushTimer = null;
     if (isPushing) return;
     isPushing = true;
+    showToast('Syncing…', '#555');
     try {
-      var body = JSON.stringify({ key: APP_KEY, data: collectLocal() });
-      var resp = await fetch(SB_URL + '/rest/v1/app_state', {
-        method: 'POST', headers: HDRS, body: body,
+      var rem    = await fetchRemote();
+      var merged = merge(local(), rem || {});
+      var resp   = await fetch(SB_URL + '/rest/v1/app_state', {
+        method: 'POST', headers: WH,
+        body: JSON.stringify({ key: APP_KEY, data: merged }),
       });
-      if (!resp.ok) {
+      if (resp.ok) {
+        applyState(merged);
+        showToast('Synced ✓', '#2a9d5c');
+      } else {
         var txt = await resp.text().catch(function(){ return ''; });
+        showToast('Sync error ' + resp.status, '#c0392b');
         console.warn('[sync] push failed', resp.status, txt);
       }
     } catch(e) {
+      showToast('Sync error (network)', '#c0392b');
       console.warn('[sync] push error', e);
     } finally {
       isPushing = false;
@@ -1578,68 +1628,49 @@ startTicker();
     pushTimer = setTimeout(push, 400);
   }
 
-  // ── Pull: plain fetch ─────────────────────────────────────────────────────
+  // ── pull: fetch remote, merge with local, apply ───────────────────────────
   async function pull() {
-    if (pushTimer || isPushing) return; // don't overwrite unsent local changes
-    try {
-      var resp = await fetch(
-        SB_URL + '/rest/v1/app_state?key=eq.' + APP_KEY + '&select=data', {
-        headers: { 'apikey': SB_KEY, 'Authorization': 'Bearer ' + SB_KEY },
-      });
-      if (!resp.ok) { console.warn('[sync] pull failed', resp.status); return; }
-      var rows = await resp.json();
-      if (rows && rows[0] && rows[0].data) applyRemote(rows[0].data);
-    } catch(e) {
-      console.warn('[sync] pull error', e);
-    }
+    if (pushTimer || isPushing) return;
+    var rem = await fetchRemote();
+    if (!rem) return;
+    applyState(merge(local(), rem));
   }
 
-  // Flush pending changes on tab close (keepalive survives page unload)
   function flushOnClose() {
-    clearTimeout(pushTimer);
-    pushTimer = null;
-    var body = JSON.stringify({ key: APP_KEY, data: collectLocal() });
     fetch(SB_URL + '/rest/v1/app_state', {
-      method: 'POST', keepalive: true, headers: HDRS, body: body,
+      method: 'POST', keepalive: true, headers: WH,
+      body: JSON.stringify({ key: APP_KEY, data: local() }),
     }).catch(function(){});
   }
 
-  // ── Patch localStorage so user writes trigger a push ──────────────────────
-  localStorage.setItem = function(key, value) {
-    _setItem(key, value);
-    if (owned(key)) schedulePush();
+  // ── patch localStorage so user edits trigger a push ───────────────────────
+  localStorage.setItem = function(k, v) {
+    _set(k, v);
+    if (k === 'goal_streak_v1' || (k && k.indexOf('goals:') === 0)) schedulePush();
   };
-  localStorage.removeItem = function(key) {
-    _removeItem(key);
-    if (owned(key)) schedulePush();
+  localStorage.removeItem = function(k) {
+    _del(k);
+    if (k === 'goal_streak_v1' || (k && k.indexOf('goals:') === 0)) schedulePush();
   };
 
-  // ── Pull on load, on tab-focus, every 15 s ────────────────────────────────
+  // ── boot: pull on load, poll every 5 s, pull on tab-focus ─────────────────
   pull();
-  document.addEventListener('visibilitychange', function() {
-    if (!document.hidden) pull();
-  });
-  setInterval(pull, 15000);
-
+  setInterval(pull, 5000);
+  document.addEventListener('visibilitychange', function() { if (!document.hidden) pull(); });
   window.addEventListener('pagehide', flushOnClose);
   window.addEventListener('beforeunload', flushOnClose);
 
-  // ── Realtime via Supabase JS (bonus — instant updates when both tabs open) ─
+  // ── realtime (instant delivery when both devices open simultaneously) ──────
   try {
-    var client = supabase.createClient(SB_URL, SB_KEY);
-    client.channel('sync:' + APP_KEY)
-      .on('postgres_changes', {
-        event: '*', schema: 'public', table: 'app_state',
-        filter: 'key=eq.' + APP_KEY,
-      }, function(payload) {
-        if (payload.new && payload.new.data && !pushTimer && !isPushing) {
-          applyRemote(payload.new.data);
-        }
-      })
+    supabase.createClient(SB_URL, SB_KEY)
+      .channel('sync:' + APP_KEY)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'app_state', filter: 'key=eq.' + APP_KEY },
+        function(payload) {
+          if (payload.new && payload.new.data && !pushTimer && !isPushing)
+            applyState(merge(local(), payload.new.data));
+        })
       .subscribe();
-  } catch(e) {
-    console.warn('[sync] realtime setup failed', e);
-  }
+  } catch(e) {}
 })();
 </script>
 
