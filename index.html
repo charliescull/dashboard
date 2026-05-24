@@ -1501,199 +1501,145 @@ setInterval(updateDayBar, 60 * 1000);
 startTicker();
 
 // ── Supabase Sync ─────────────────────────────────────────────────────────────
-(function initSupabaseSync() {
-  const SUPABASE_URL = 'https://fntashiwcbooeqmukcak.supabase.co';
-  const SUPABASE_KEY = 'sb_publishable_aFr9XKECSnIQES6cpBed9g_IfjqZ7Ym';
-  const APP_KEY = 'dashboard';
+(function initSync() {
+  var SB_URL  = 'https://fntashiwcbooeqmukcak.supabase.co';
+  var SB_KEY  = 'sb_publishable_aFr9XKECSnIQES6cpBed9g_IfjqZ7Ym';
+  var APP_KEY = 'dashboard';
+  var HDRS    = {
+    'Content-Type':  'application/json',
+    'apikey':        SB_KEY,
+    'Authorization': 'Bearer ' + SB_KEY,
+    'Prefer':        'resolution=merge-duplicates,return=minimal',
+  };
 
-  const client = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+  // Capture native storage ops before monkey-patching so applyRemote
+  // never triggers a push-back loop.
+  var _setItem    = localStorage.setItem.bind(localStorage);
+  var _removeItem = localStorage.removeItem.bind(localStorage);
 
-  // Capture originals before patching — applyRemote uses these directly
-  // so writing remote data never triggers a push back to Supabase.
-  const _setItem = localStorage.setItem.bind(localStorage);
-  const _removeItem = localStorage.removeItem.bind(localStorage);
+  var pushTimer = null;
+  var isPushing = false;
 
-  let lastSyncedJson = null;
-  let pendingRemote = null;
-  let pushTimer = null;
-  let isPushing = false;
-  let isFocused = false;
-
-  document.addEventListener('focusin', e => {
-    const t = e.target;
-    if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' ||
-        t.tagName === 'SELECT' || t.isContentEditable)) {
-      isFocused = true;
-    }
-  });
-  document.addEventListener('focusout', () => {
-    isFocused = false;
-    if (pendingRemote) { applyRemote(pendingRemote); pendingRemote = null; }
-  });
-
-  function collectLocal() {
-    const state = {};
-    const raw = localStorage.getItem('goal_streak_v1');
-    state['goal_streak_v1'] = raw !== null ? JSON.parse(raw) : null;
-    for (let i = 0; i < localStorage.length; i++) {
-      const k = localStorage.key(i);
-      if (k && k.startsWith('goals:')) {
-        state[k] = JSON.parse(localStorage.getItem(k));
-      }
-    }
-    return state;
+  function owned(k) {
+    return k === 'goal_streak_v1' || (k && k.indexOf('goals:') === 0);
   }
 
-  // Uses original _setItem/_removeItem so applying remote never
-  // triggers schedulePush() — no push-back loop possible.
-  function applyRemote(state) {
-    for (const [k, v] of Object.entries(state)) {
-      if (v === null) _removeItem(k);
+  function collectLocal() {
+    var out = {};
+    var raw = localStorage.getItem('goal_streak_v1');
+    out['goal_streak_v1'] = raw ? JSON.parse(raw) : null;
+    for (var i = 0; i < localStorage.length; i++) {
+      var k = localStorage.key(i);
+      if (k && k.indexOf('goals:') === 0) {
+        try { out[k] = JSON.parse(localStorage.getItem(k)); } catch(e) {}
+      }
+    }
+    return out;
+  }
+
+  function applyRemote(remote) {
+    if (!remote || typeof remote !== 'object') return;
+    var keys = Object.keys(remote);
+    for (var i = 0; i < keys.length; i++) {
+      var k = keys[i];
+      if (!owned(k)) continue;
+      var v = remote[k];
+      if (v === null || v === undefined) _removeItem(k);
       else _setItem(k, JSON.stringify(v));
     }
-    // Align lastSyncedJson with what collectLocal() would return now,
-    // preventing a false "dirty" detection and spurious re-push.
-    lastSyncedJson = JSON.stringify(collectLocal());
     loadToday();
     loadTomorrow();
     renderStreak();
   }
 
-  async function pushNow() {
+  // ── Push: plain fetch so it works on every mobile browser ────────────────
+  async function push() {
     pushTimer = null;
+    if (isPushing) return;
     isPushing = true;
     try {
-      const state = collectLocal();
-      const json = JSON.stringify(state);
-      if (json === lastSyncedJson) return;
-      const { error } = await client.from('app_state').upsert(
-        { key: APP_KEY, data: state },
-        { onConflict: 'key' }
-      );
-      if (error) {
-        console.warn('[sync] push error', error);
-        // lastSyncedJson NOT updated — next change will retry
-      } else {
-        lastSyncedJson = json;
+      var body = JSON.stringify({ key: APP_KEY, data: collectLocal() });
+      var resp = await fetch(SB_URL + '/rest/v1/app_state', {
+        method: 'POST', headers: HDRS, body: body,
+      });
+      if (!resp.ok) {
+        var txt = await resp.text().catch(function(){ return ''; });
+        console.warn('[sync] push failed', resp.status, txt);
       }
-    } catch (err) {
-      console.warn('[sync] push failed', err);
+    } catch(e) {
+      console.warn('[sync] push error', e);
     } finally {
       isPushing = false;
     }
   }
 
   function schedulePush() {
-    if (pushTimer) clearTimeout(pushTimer);
-    pushTimer = setTimeout(pushNow, 250);
+    clearTimeout(pushTimer);
+    pushTimer = setTimeout(push, 400);
   }
 
-  async function flushOnClose() {
-    if (!pushTimer) return;
+  // ── Pull: plain fetch ─────────────────────────────────────────────────────
+  async function pull() {
+    if (pushTimer || isPushing) return; // don't overwrite unsent local changes
+    try {
+      var resp = await fetch(
+        SB_URL + '/rest/v1/app_state?key=eq.' + APP_KEY + '&select=data', {
+        headers: { 'apikey': SB_KEY, 'Authorization': 'Bearer ' + SB_KEY },
+      });
+      if (!resp.ok) { console.warn('[sync] pull failed', resp.status); return; }
+      var rows = await resp.json();
+      if (rows && rows[0] && rows[0].data) applyRemote(rows[0].data);
+    } catch(e) {
+      console.warn('[sync] pull error', e);
+    }
+  }
+
+  // Flush pending changes on tab close (keepalive survives page unload)
+  function flushOnClose() {
     clearTimeout(pushTimer);
     pushTimer = null;
-    try {
-      const state = collectLocal();
-      const json = JSON.stringify(state);
-      if (json === lastSyncedJson) return;
-      lastSyncedJson = json;
-      await fetch(`${SUPABASE_URL}/rest/v1/app_state`, {
-        method: 'POST',
-        keepalive: true,
-        headers: {
-          'Content-Type': 'application/json',
-          'apikey': SUPABASE_KEY,
-          'Authorization': `Bearer ${SUPABASE_KEY}`,
-          'Prefer': 'resolution=merge-duplicates',
-        },
-        body: JSON.stringify({ key: APP_KEY, data: state }),
-      });
-    } catch {}
+    var body = JSON.stringify({ key: APP_KEY, data: collectLocal() });
+    fetch(SB_URL + '/rest/v1/app_state', {
+      method: 'POST', keepalive: true, headers: HDRS, body: body,
+    }).catch(function(){});
   }
 
-  async function pullLatest() {
-    // Don't overwrite local changes that haven't been pushed yet
-    if (pushTimer !== null || isPushing) return;
-    try {
-      const { data, error } = await client
-        .from('app_state')
-        .select('data')
-        .eq('key', APP_KEY)
-        .single();
-      if (!error && data?.data && Object.keys(data.data).length > 0) {
-        applyRemote(data.data);
-      }
-    } catch {}
-  }
-
-  window.addEventListener('pagehide', flushOnClose);
-  window.addEventListener('beforeunload', flushOnClose);
-  document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'hidden') {
-      flushOnClose();
-    } else {
-      // Tab became visible — pull latest in case realtime missed anything
-      pullLatest();
-    }
-  });
-
-  // Poll every 30 s as a safety net if realtime drops
-  setInterval(pullLatest, 30000);
-
-  // Patch localStorage so user-driven writes trigger a push.
+  // ── Patch localStorage so user writes trigger a push ──────────────────────
   localStorage.setItem = function(key, value) {
     _setItem(key, value);
-    if (key === 'goal_streak_v1' || key.startsWith('goals:')) schedulePush();
+    if (owned(key)) schedulePush();
   };
   localStorage.removeItem = function(key) {
     _removeItem(key);
-    if (key === 'goal_streak_v1' || key.startsWith('goals:')) schedulePush();
+    if (owned(key)) schedulePush();
   };
 
-  async function init() {
-    try {
-      const { data, error } = await client
-        .from('app_state')
-        .select('data')
-        .eq('key', APP_KEY)
-        .single();
+  // ── Pull on load, on tab-focus, every 15 s ────────────────────────────────
+  pull();
+  document.addEventListener('visibilitychange', function() {
+    if (!document.hidden) pull();
+  });
+  setInterval(pull, 15000);
 
-      if (error && error.code !== 'PGRST116') {
-        console.warn('[sync] init pull error', error);
-      } else if (data?.data && Object.keys(data.data).length > 0) {
-        // Remote has data — always apply it on load so the latest
-        // changes from any device are reflected immediately.
-        applyRemote(data.data);
-      } else {
-        // No remote row yet — seed Supabase from local.
-        await pushNow();
-      }
-    } catch (err) {
-      console.warn('[sync] init failed', err);
-    }
+  window.addEventListener('pagehide', flushOnClose);
+  window.addEventListener('beforeunload', flushOnClose);
 
-    // Live updates: no echo-check needed because applyRemote never
-    // pushes back, so there is no loop risk.
-    client
-      .channel(`app_state:${APP_KEY}`)
+  // ── Realtime via Supabase JS (bonus — instant updates when both tabs open) ─
+  try {
+    var client = supabase.createClient(SB_URL, SB_KEY);
+    client.channel('sync:' + APP_KEY)
       .on('postgres_changes', {
-        event: '*',
-        schema: 'public',
-        table: 'app_state',
-        filter: `key=eq.${APP_KEY}`,
-      }, payload => {
-        const incoming = payload.new?.data;
-        if (!incoming) return;
-        if (isFocused) {
-          pendingRemote = incoming;
-        } else {
-          applyRemote(incoming);
+        event: '*', schema: 'public', table: 'app_state',
+        filter: 'key=eq.' + APP_KEY,
+      }, function(payload) {
+        if (payload.new && payload.new.data && !pushTimer && !isPushing) {
+          applyRemote(payload.new.data);
         }
       })
       .subscribe();
+  } catch(e) {
+    console.warn('[sync] realtime setup failed', e);
   }
-
-  init();
 })();
 </script>
 
