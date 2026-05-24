@@ -1516,6 +1516,7 @@ startTicker();
   let lastSyncedJson = null;
   let pendingRemote = null;
   let pushTimer = null;
+  let isPushing = false;
   let isFocused = false;
 
   document.addEventListener('focusin', e => {
@@ -1559,18 +1560,26 @@ startTicker();
   }
 
   async function pushNow() {
+    pushTimer = null;
+    isPushing = true;
     try {
       const state = collectLocal();
       const json = JSON.stringify(state);
       if (json === lastSyncedJson) return;
-      lastSyncedJson = json;
       const { error } = await client.from('app_state').upsert(
         { key: APP_KEY, data: state },
         { onConflict: 'key' }
       );
-      if (error) console.warn('[sync] push error', error);
+      if (error) {
+        console.warn('[sync] push error', error);
+        // lastSyncedJson NOT updated — next change will retry
+      } else {
+        lastSyncedJson = json;
+      }
     } catch (err) {
       console.warn('[sync] push failed', err);
+    } finally {
+      isPushing = false;
     }
   }
 
@@ -1602,11 +1611,34 @@ startTicker();
     } catch {}
   }
 
+  async function pullLatest() {
+    // Don't overwrite local changes that haven't been pushed yet
+    if (pushTimer !== null || isPushing) return;
+    try {
+      const { data, error } = await client
+        .from('app_state')
+        .select('data')
+        .eq('key', APP_KEY)
+        .single();
+      if (!error && data?.data && Object.keys(data.data).length > 0) {
+        applyRemote(data.data);
+      }
+    } catch {}
+  }
+
   window.addEventListener('pagehide', flushOnClose);
   window.addEventListener('beforeunload', flushOnClose);
   document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'hidden') flushOnClose();
+    if (document.visibilityState === 'hidden') {
+      flushOnClose();
+    } else {
+      // Tab became visible — pull latest in case realtime missed anything
+      pullLatest();
+    }
   });
+
+  // Poll every 30 s as a safety net if realtime drops
+  setInterval(pullLatest, 30000);
 
   // Patch localStorage so user-driven writes trigger a push.
   localStorage.setItem = function(key, value) {

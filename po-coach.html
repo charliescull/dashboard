@@ -3382,6 +3382,7 @@ img, video, canvas, svg { max-width: 100%; }
   // ── Push to Supabase ───────────────────────────────────────────────────────
   async function pcPushNow() {
     if (!pcSupa) return;
+    pcPushTimer = null;
     const snapshot = pcCollectState();
     const json     = JSON.stringify(snapshot);
     if (json === pcLastSyncedJson) return;
@@ -3393,6 +3394,7 @@ img, video, canvas, svg { max-width: 100%; }
       if (error) {
         console.warn('[sync] push failed:', error.message, error);
         setSyncStatus('error');
+        // pcLastSyncedJson NOT updated — next change will retry the push
       } else {
         pcLastSyncedJson = json;
         setSyncStatus('ok');
@@ -3447,18 +3449,15 @@ img, video, canvas, svg { max-width: 100%; }
         return;
       }
       if (data && data.data && Object.keys(data.data).length > 0) {
-        const remoteJson = JSON.stringify(data.state);
+        const remoteJson = JSON.stringify(data.data);
         const localJson  = JSON.stringify(pcCollectState());
         if (remoteJson !== localJson) {
           const choice = confirm(
-            'This device and the cloud have different data.
-
-' +
-            'OK  → Replace this device with cloud data
-' +
-            'Cancel → Push this device’s data to cloud'
+            ‘This device and the cloud have different data.\n\n’ +
+            ‘OK  → Replace this device with cloud data\n’ +
+            ‘Cancel → Push this device\’s data to cloud’
           );
-          if (choice) { pcLastSyncedJson = remoteJson; pcApplyRemoteState(data.state); setSyncStatus('ok'); }
+          if (choice) { pcLastSyncedJson = remoteJson; pcApplyRemoteState(data.data); setSyncStatus(‘ok’); }
           else        { await pcPushNow(); }
         } else {
           setSyncStatus('ok');
@@ -3486,11 +3485,11 @@ img, video, canvas, svg { max-width: 100%; }
 
     try {
       const { data, error } = await pcSupa
-        .from('app_state').select('state').eq('key', APP_KEY).maybeSingle();
+        .from('app_state').select('data').eq('key', APP_KEY).maybeSingle();
       if (error) {
         console.warn('[sync] initial pull error:', error.message, error);
         setSyncStatus('error');
-      } else if (data && data.state && Object.keys(data.state).length > 0) {
+      } else if (data && data.data && Object.keys(data.data).length > 0) {
         console.log('[sync] pulled remote state');
         pcLastSyncedJson = JSON.stringify(data.data);
         pcMaybeApplyRemote(data.data);
@@ -3533,10 +3532,28 @@ img, video, canvas, svg { max-width: 100%; }
       ?.addEventListener('click', pcForceSync);
   })();
 
+  async function pcPullLatest() {
+    if (!pcSupa || pcPushTimer !== null) return;
+    try {
+      const { data, error } = await pcSupa
+        .from('app_state').select('data').eq('key', APP_KEY).maybeSingle();
+      if (!error && data && data.data && Object.keys(data.data).length > 0) {
+        pcMaybeApplyRemote(data.data);
+      }
+    } catch {}
+  }
+
   document.addEventListener('focusout', () => { setTimeout(pcApplyPendingIfReady, 0); }, true);
   window.addEventListener('pagehide',          pcFlushPushOnUnload);
   window.addEventListener('beforeunload',      pcFlushPushOnUnload);
-  document.addEventListener('visibilitychange',() => { if (document.hidden) pcFlushPushOnUnload(); });
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) {
+      pcFlushPushOnUnload();
+    } else {
+      pcPullLatest();
+    }
+  });
+  setInterval(pcPullLatest, 30000);
 })();
 </script>
 
